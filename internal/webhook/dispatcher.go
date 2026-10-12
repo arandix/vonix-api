@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +37,10 @@ func NewStore() *Store {
 }
 
 func (s *Store) Create(businessID string, req models.CreateWebhookRequest) (*models.Webhook, error) {
+	// SSRF prevention: block internal IPs and non-HTTPS
+	if err := validateWebhookURL(req.URL); err != nil {
+		return nil, err
+	}
 	secret, err := generateSecret()
 	if err != nil {
 		return nil, err
@@ -61,7 +67,7 @@ func (s *Store) List(businessID string) []models.Webhook {
 	for _, wh := range s.webhooks {
 		if wh.BusinessID == businessID && wh.Active {
 			cp := *wh
-			cp.Secret = "" // never re-expose secret
+			cp.Secret = ""
 			out = append(out, cp)
 		}
 	}
@@ -79,14 +85,13 @@ func (s *Store) Delete(businessID, id string) bool {
 	return true
 }
 
-// Dispatch sends a webhook event to all matching endpoints asynchronously
+// Dispatch sends the event to all matching endpoints asynchronously.
 func (s *Store) Dispatch(businessID string, event models.WebhookEvent, data any) {
 	s.mu.RLock()
-	var targets []*models.Webhook
+	var targets []models.Webhook
 	for _, wh := range s.webhooks {
-		if wh.BusinessID == businessID && wh.Active && hasEvent(wh.Events, event) {
-			cp := *wh
-			targets = append(targets, &cp)
+		if wh.BusinessID == businessID && wh.Active && matchesEvent(wh.Events, event) {
+			targets = append(targets, *wh)
 		}
 	}
 	s.mu.RUnlock()
@@ -102,15 +107,15 @@ func (s *Store) Dispatch(businessID string, event models.WebhookEvent, data any)
 		CreatedAt:  time.Now().UTC(),
 		Data:       data,
 	}
-
 	body, err := json.Marshal(payload)
 	if err != nil {
-		slog.Error("webhook marshal", "err", err)
+		slog.Error("webhook marshal failed", "err", err)
 		return
 	}
 
 	for _, wh := range targets {
-		go deliver(wh, body)
+		wh := wh
+		go deliver(&wh, body)
 	}
 }
 
@@ -122,7 +127,7 @@ func deliver(wh *models.Webhook, body []byte) {
 
 		req, err := http.NewRequest(http.MethodPost, wh.URL, bytes.NewReader(body))
 		if err != nil {
-			slog.Error("webhook request build", "err", err, "url", wh.URL)
+			slog.Error("webhook request build failed", "err", err)
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -136,16 +141,17 @@ func deliver(wh *models.Webhook, body []byte) {
 			if resp.StatusCode < 300 {
 				return
 			}
+			slog.Warn("webhook endpoint returned error", "url", wh.URL, "status", resp.StatusCode)
+		} else {
+			slog.Warn("webhook delivery failed", "url", wh.URL, "err", err)
 		}
 
 		backoff := time.Duration(1<<attempt) * time.Second
-		slog.Warn("webhook delivery failed", "url", wh.URL, "attempt", attempt+1, "retry_in", backoff)
 		time.Sleep(backoff)
 	}
-	slog.Error("webhook permanently failed", "url", wh.URL)
+	slog.Error("webhook permanently failed after retries", "url", wh.URL)
 }
 
-// sign creates an HMAC-SHA256 signature: sha256=hex(hmac(secret, "ts.body"))
 func sign(secret, ts string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(ts + "."))
@@ -153,10 +159,58 @@ func sign(secret, ts string, body []byte) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// VerifySignature verifies an incoming webhook signature (for re-emitting)
+// VerifySignature verifies an incoming webhook using the stored secret.
 func VerifySignature(secret, ts, sigHeader string, body []byte) bool {
 	expected := "sha256=" + sign(secret, ts, body)
 	return hmac.Equal([]byte(expected), []byte(sigHeader))
+}
+
+// matchesEvent checks if the event matches any registered pattern.
+// Supports exact match ("transfer.completed") and wildcard ("transfer.*").
+func matchesEvent(registered []models.WebhookEvent, event models.WebhookEvent) bool {
+	for _, r := range registered {
+		if r == event {
+			return true
+		}
+		// wildcard: "transfer.*" matches "transfer.completed"
+		if strings.HasSuffix(string(r), ".*") {
+			prefix := strings.TrimSuffix(string(r), ".*")
+			if strings.HasPrefix(string(event), prefix+".") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validateWebhookURL blocks SSRF by rejecting non-HTTPS and private/loopback IPs.
+func validateWebhookURL(rawURL string) error {
+	u, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return fmt.Errorf("webhook url is invalid: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("webhook url must use HTTPS")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("webhook url has no host")
+	}
+	// Resolve and block private/loopback addresses
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("webhook host could not be resolved: %w", err)
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("webhook url must not point to a private or loopback address")
+		}
+	}
+	return nil
 }
 
 func generateSecret() (string, error) {
@@ -171,23 +225,4 @@ func newID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return fmt.Sprintf("%x", b)
-}
-
-func hasEvent(events []models.WebhookEvent, target models.WebhookEvent) bool {
-	for _, e := range events {
-		if e == target || e == "*" {
-			return true
-		}
-	}
-	return strings.Contains(string(target), ".") &&
-		contains(events, models.WebhookEvent(strings.Split(string(target), ".")[0]+".*"))
-}
-
-func contains(events []models.WebhookEvent, target models.WebhookEvent) bool {
-	for _, e := range events {
-		if e == target {
-			return true
-		}
-	}
-	return false
 }

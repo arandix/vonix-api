@@ -6,96 +6,109 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vonix/api/internal/models"
 )
 
 const (
-	keyPrefix  = "vx_live_"
+	livePrefix = "vx_live_"
 	testPrefix = "vx_test_"
 	keyLength  = 32
 )
 
-// APIKeyStore is an in-memory store (replace with DB in production)
 type APIKeyStore struct {
-	keys map[string]*storedKey
+	mu   sync.RWMutex
+	keys map[string]*storedKey // keyed by hash
 }
 
 type storedKey struct {
-	APIKey  models.APIKey
-	Hash    string
+	key  models.APIKey
+	hash string
 }
 
 func NewAPIKeyStore() *APIKeyStore {
 	return &APIKeyStore{keys: make(map[string]*storedKey)}
 }
 
-// Generate creates a new API key, returning the plain-text key (shown once)
+// Generate creates a new API key; returns the record and the plain-text value (shown once).
 func (s *APIKeyStore) Generate(businessID string, req models.CreateAPIKeyRequest) (*models.APIKey, string, error) {
 	raw := make([]byte, keyLength)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, "", fmt.Errorf("generate key bytes: %w", err)
 	}
-	plain := keyPrefix + hex.EncodeToString(raw)
+	plain := livePrefix + hex.EncodeToString(raw)
 	hash := hashKey(plain)
-	prefix := plain[:len(keyPrefix)+8] + "..."
+	prefix := plain[:len(livePrefix)+8] + "..."
 
-	id := newID()
 	now := time.Now().UTC()
-	key := models.APIKey{
-		ID:         id,
+	k := models.APIKey{
+		ID:         newID(),
 		BusinessID: businessID,
 		Name:       req.Name,
 		KeyPrefix:  prefix,
-		Key:        plain,
+		Key:        plain, // caller reads this and we clear it on list/validate
 		Scopes:     req.Scopes,
 		ExpiresAt:  req.ExpiresAt,
 		Active:     true,
 		CreatedAt:  now,
 	}
 
-	s.keys[hash] = &storedKey{APIKey: key, Hash: hash}
-	return &key, plain, nil
+	s.mu.Lock()
+	s.keys[hash] = &storedKey{key: k, hash: hash}
+	s.mu.Unlock()
+
+	return &k, plain, nil
 }
 
-// Validate checks the key and returns the associated APIKey
+// Validate authenticates a plain-text key and returns the associated record.
 func (s *APIKeyStore) Validate(plain string) (*models.APIKey, bool) {
-	if !strings.HasPrefix(plain, keyPrefix) && !strings.HasPrefix(plain, testPrefix) {
+	if !strings.HasPrefix(plain, livePrefix) && !strings.HasPrefix(plain, testPrefix) {
 		return nil, false
 	}
 	hash := hashKey(plain)
-	stored, ok := s.keys[hash]
-	if !ok || !stored.APIKey.Active {
+
+	s.mu.Lock()
+	sk, ok := s.keys[hash]
+	if ok && sk.key.Active {
+		now := time.Now().UTC()
+		sk.key.LastUsedAt = &now
+	}
+	s.mu.Unlock()
+
+	if !ok || !sk.key.Active {
 		return nil, false
 	}
-	if stored.APIKey.ExpiresAt != nil && stored.APIKey.ExpiresAt.Before(time.Now()) {
+	if sk.key.ExpiresAt != nil && sk.key.ExpiresAt.Before(time.Now()) {
 		return nil, false
 	}
-	now := time.Now().UTC()
-	stored.APIKey.LastUsedAt = &now
-	cp := stored.APIKey
-	cp.Key = "" // never expose after creation
+	cp := sk.key
+	cp.Key = "" // never re-expose
 	return &cp, true
 }
 
-// Revoke marks an API key as inactive
+// Revoke marks a key as inactive by (businessID, keyID).
 func (s *APIKeyStore) Revoke(businessID, keyID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, sk := range s.keys {
-		if sk.APIKey.ID == keyID && sk.APIKey.BusinessID == businessID {
-			sk.APIKey.Active = false
+		if sk.key.ID == keyID && sk.key.BusinessID == businessID {
+			sk.key.Active = false
 			return true
 		}
 	}
 	return false
 }
 
-// List returns all keys for a business (without plain-text key)
+// List returns all active keys for a business without the plain-text value.
 func (s *APIKeyStore) List(businessID string) []models.APIKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var out []models.APIKey
 	for _, sk := range s.keys {
-		if sk.APIKey.BusinessID == businessID {
-			cp := sk.APIKey
+		if sk.key.BusinessID == businessID {
+			cp := sk.key
 			cp.Key = ""
 			out = append(out, cp)
 		}
