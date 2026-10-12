@@ -1,0 +1,707 @@
+openapi: 3.1.0
+info:
+  title: Vonix Business API
+  version: "1.0"
+  description: |
+    The Vonix Business API lets you programmatically manage accounts, send and receive
+    payments (fiat & crypto), and receive real-time events via webhooks.
+
+    ## Authentication
+
+    All requests must include your API key in the `Authorization` header:
+
+    ```
+    Authorization: Bearer vx_live_...
+    ```
+
+    You can also use the `X-API-Key` header as an alternative.
+
+    ## API Keys & Scopes
+
+    | Scope | Description |
+    |-------|-------------|
+    | `accounts:read` | View balances and account info |
+    | `transfers:write` | Initiate fiat transfers |
+    | `crypto:write` | Send crypto, get deposit addresses |
+    | `webhooks:write` | Create and manage webhooks |
+
+    ## Webhooks
+
+    Every webhook POST includes two headers for verification:
+
+    - `Vonix-Timestamp` — Unix timestamp of the delivery
+    - `Vonix-Signature` — `sha256=HMAC_SHA256(secret, timestamp + "." + body)`
+
+    ```javascript
+    const crypto = require("crypto");
+    function verifyWebhook(secret, timestamp, signature, body) {
+      const expected = "sha256=" + crypto
+        .createHmac("sha256", secret)
+        .update(timestamp + "." + body)
+        .digest("hex");
+      return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+    }
+    ```
+
+    ## Errors
+
+    | HTTP | Code | Meaning |
+    |------|------|---------|
+    | 400 | `invalid_request` | Malformed JSON |
+    | 401 | `missing_api_key` | No key provided |
+    | 401 | `invalid_api_key` | Key invalid or expired |
+    | 403 | `insufficient_scope` | Key lacks required scope |
+    | 422 | `validation_error` | Invalid field values |
+    | 429 | `rate_limited` | Too many requests |
+    | 500 | `internal_error` | Server-side error |
+
+  contact:
+    name: Vonix Developer Support
+    email: api@getvonix.com
+    url: https://docs.getvonix.com
+  license:
+    name: MIT
+
+servers:
+  - url: https://api.getvonix.com
+    description: Production
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Accounts
+    description: View accounts and balances
+  - name: Transfers
+    description: Fiat transfers (SEPA, SWIFT, Faster Payments)
+  - name: Crypto
+    description: Cryptocurrency deposits and withdrawals
+  - name: Webhooks
+    description: Real-time event delivery
+  - name: API Keys
+    description: Manage API keys and scopes
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        "200":
+          description: API is operational
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: "1.0.0"
+
+  /v1/balance:
+    get:
+      tags: [Accounts]
+      summary: Get all balances
+      description: Returns the available and pending balances for all currencies in your business account.
+      security:
+        - BearerAuth: [accounts:read]
+      responses:
+        "200":
+          description: Balances retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  business_id:
+                    type: string
+                  balances:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Balance"
+                  as_of:
+                    type: string
+                    format: date-time
+
+  /v1/accounts:
+    get:
+      tags: [Accounts]
+      summary: List accounts
+      description: Returns all fiat and crypto accounts for your business.
+      security:
+        - BearerAuth: [accounts:read]
+      responses:
+        "200":
+          description: Account list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedAccounts"
+
+  /v1/transfers:
+    get:
+      tags: [Transfers]
+      summary: List transactions
+      security:
+        - BearerAuth: [accounts:read]
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 25
+            maximum: 100
+      responses:
+        "200":
+          description: Transaction list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTransfers"
+    post:
+      tags: [Transfers]
+      summary: Send fiat payment
+      description: |
+        Initiates a fiat payment via SEPA, SWIFT, or Faster Payments depending on the
+        recipient's IBAN and currency.
+      security:
+        - BearerAuth: [transfers:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTransferRequest"
+            examples:
+              sepa:
+                summary: SEPA EUR transfer
+                value:
+                  currency: USD
+                  amount: "500.00"
+                  recipient:
+                    name: Acme Ltd
+                    iban: DE89370400440532013000
+                  reference: INV-2024-007
+                  external_id: order_abc123
+      responses:
+        "201":
+          description: Transfer created (status will be updated via webhook)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+
+  /v1/crypto/assets:
+    get:
+      tags: [Crypto]
+      summary: List supported assets
+      security: []
+      responses:
+        "200":
+          description: Supported assets and networks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CryptoAsset"
+
+  /v1/crypto/deposit-address:
+    get:
+      tags: [Crypto]
+      summary: Get deposit address
+      description: |
+        Returns a unique deposit address for your business. Monitor for incoming
+        deposits via the `deposit.received` and `deposit.confirmed` webhook events.
+      security:
+        - BearerAuth: [accounts:read]
+      parameters:
+        - name: currency
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [BTC, ETH, USDT, BNB]
+          example: USDT
+        - name: network
+          in: query
+          schema:
+            type: string
+            enum: [bitcoin, ethereum, tron, bnb_smart_chain]
+          example: ethereum
+      responses:
+        "200":
+          description: Deposit address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepositAddress"
+
+  /v1/crypto/send:
+    post:
+      tags: [Crypto]
+      summary: Send cryptocurrency
+      security:
+        - BearerAuth: [crypto:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendCryptoRequest"
+            examples:
+              usdt_eth:
+                summary: Send USDT on Ethereum
+                value:
+                  currency: USDT
+                  network: ethereum
+                  amount: "250.000000"
+                  address: "0xAbCd1234..."
+                  external_id: payout_eth_001
+      responses:
+        "201":
+          description: Withdrawal initiated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+
+  /v1/webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List webhooks
+      security:
+        - BearerAuth: [accounts:read]
+      responses:
+        "200":
+          description: Webhook list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedWebhooks"
+    post:
+      tags: [Webhooks]
+      summary: Create webhook
+      description: |
+        Register an HTTPS endpoint to receive real-time events. The response
+        includes a `secret` used to verify signatures — store it securely; it will
+        not be shown again.
+      security:
+        - BearerAuth: [webhooks:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWebhookRequest"
+            examples:
+              all_transfers:
+                value:
+                  url: https://yourapp.com/webhooks/vonix
+                  events:
+                    - transfer.created
+                    - transfer.completed
+                    - transfer.failed
+                    - deposit.received
+                    - deposit.confirmed
+      responses:
+        "201":
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+
+  /v1/webhooks/{webhookID}:
+    delete:
+      tags: [Webhooks]
+      summary: Delete webhook
+      security:
+        - BearerAuth: [webhooks:write]
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Webhook deleted
+
+  /v1/api-keys:
+    get:
+      tags: [API Keys]
+      summary: List API keys
+      security:
+        - BearerAuth: [accounts:read]
+      responses:
+        "200":
+          description: API key list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedAPIKeys"
+    post:
+      tags: [API Keys]
+      summary: Create API key
+      description: |
+        Creates a new API key. The plain-text key is returned **only once** in
+        the `key` field — store it immediately and treat it like a password.
+      security:
+        - BearerAuth: [webhooks:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAPIKeyRequest"
+      responses:
+        "201":
+          description: API key created (key shown once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+
+  /v1/api-keys/{keyID}:
+    delete:
+      tags: [API Keys]
+      summary: Revoke API key
+      security:
+        - BearerAuth: [webhooks:write]
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Key revoked
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: "Pass your API key: `Authorization: Bearer vx_live_...`"
+
+  schemas:
+    Balance:
+      type: object
+      properties:
+        currency:
+          type: string
+          example: USD
+        available:
+          type: string
+          example: "24850.00"
+        pending:
+          type: string
+          example: "1200.00"
+        total:
+          type: string
+          example: "26050.00"
+
+    Account:
+      type: object
+      properties:
+        id:
+          type: string
+        business_id:
+          type: string
+        type:
+          type: string
+          enum: [fiat, crypto]
+        currency:
+          type: string
+        iban:
+          type: string
+          description: Present for fiat accounts
+        network:
+          type: string
+          description: Present for crypto accounts
+        balance:
+          $ref: "#/components/schemas/Balance"
+        created_at:
+          type: string
+          format: date-time
+
+    Transfer:
+      type: object
+      properties:
+        id:
+          type: string
+        business_id:
+          type: string
+        type:
+          type: string
+          enum: [fiat_transfer, crypto_send]
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        currency:
+          type: string
+        amount:
+          type: string
+        fee:
+          type: string
+        net:
+          type: string
+        recipient:
+          $ref: "#/components/schemas/Recipient"
+        reference:
+          type: string
+        external_id:
+          type: string
+        network:
+          type: string
+        tx_hash:
+          type: string
+        confirmations:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Recipient:
+      type: object
+      properties:
+        name:
+          type: string
+        iban:
+          type: string
+        address:
+          type: string
+        network:
+          type: string
+
+    DepositAddress:
+      type: object
+      properties:
+        currency:
+          type: string
+        network:
+          type: string
+        address:
+          type: string
+        memo:
+          type: string
+          nullable: true
+        qr_code:
+          type: string
+          format: uri
+
+    CryptoAsset:
+      type: object
+      properties:
+        currency:
+          type: string
+        name:
+          type: string
+        networks:
+          type: array
+          items:
+            type: string
+        decimals:
+          type: integer
+
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: string
+        business_id:
+          type: string
+        url:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+        secret:
+          type: string
+          description: Only returned on creation
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    APIKey:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        key_prefix:
+          type: string
+          example: "vx_live_a1b2c3..."
+        key:
+          type: string
+          description: Full key — only returned on creation
+        scopes:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    CreateTransferRequest:
+      type: object
+      required: [currency, amount, recipient]
+      properties:
+        currency:
+          type: string
+        amount:
+          type: string
+        recipient:
+          $ref: "#/components/schemas/Recipient"
+        reference:
+          type: string
+        external_id:
+          type: string
+
+    SendCryptoRequest:
+      type: object
+      required: [currency, network, amount, address]
+      properties:
+        currency:
+          type: string
+        network:
+          type: string
+        amount:
+          type: string
+        address:
+          type: string
+        memo:
+          type: string
+        external_id:
+          type: string
+
+    CreateWebhookRequest:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+              - transfer.created
+              - transfer.completed
+              - transfer.failed
+              - deposit.received
+              - deposit.confirmed
+
+    CreateAPIKeyRequest:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+            enum:
+              - accounts:read
+              - transfers:write
+              - crypto:write
+              - webhooks:write
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+
+    PaginatedAccounts:
+      allOf:
+        - $ref: "#/components/schemas/Pagination"
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/Account"
+
+    PaginatedTransfers:
+      allOf:
+        - $ref: "#/components/schemas/Pagination"
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/Transfer"
+
+    PaginatedWebhooks:
+      allOf:
+        - $ref: "#/components/schemas/Pagination"
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/Webhook"
+
+    PaginatedAPIKeys:
+      allOf:
+        - $ref: "#/components/schemas/Pagination"
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/APIKey"
+
+    Pagination:
+      type: object
+      properties:
+        total_count:
+          type: integer
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
