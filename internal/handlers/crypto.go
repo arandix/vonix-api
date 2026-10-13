@@ -76,6 +76,12 @@ func (h *CryptoHandler) SendCrypto(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:  time.Now().UTC(),
 	}
 
+	// Idempotency: same external_id + same business = return original result
+	if existing, dup := checkOrStore(bid, req.ExternalID, transfer); dup {
+		respond(w, http.StatusOK, existing)
+		return
+	}
+
 	go h.Webhooks.Dispatch(bid, models.EventTransferCreated, transfer)
 	go func() {
 		time.Sleep(30 * time.Second) // production: wait for blockchain confirmation
@@ -117,8 +123,8 @@ func validateCryptoSend(req models.SendCryptoRequest) error {
 	if req.Address == "" {
 		return fmt.Errorf("address is required")
 	}
-	if req.Amount == "" || req.Amount == "0" {
-		return fmt.Errorf("amount is required and must be non-zero")
+	if err := validateAmount(req.Amount); err != nil {
+		return err
 	}
 	networks, ok := supportedNetworks[req.Currency]
 	if !ok {

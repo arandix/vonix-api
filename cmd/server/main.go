@@ -77,8 +77,8 @@ func main() {
 		r.With(auth.RequireScope(models.ScopeWebhooks)).Delete("/v1/webhooks/{webhookID}", webhookH.Delete)
 
 		r.With(auth.RequireScope(models.ScopeRead)).Get("/v1/api-keys", apiKeyH.List)
-		r.With(auth.RequireScope(models.ScopeWebhooks)).Post("/v1/api-keys", apiKeyH.Create)
-		r.With(auth.RequireScope(models.ScopeWebhooks)).Delete("/v1/api-keys/{keyID}", apiKeyH.Revoke)
+		r.With(auth.RequireScope(models.ScopeAPIKeys)).Post("/v1/api-keys", apiKeyH.Create)
+		r.With(auth.RequireScope(models.ScopeAPIKeys)).Delete("/v1/api-keys/{keyID}", apiKeyH.Revoke)
 	})
 
 	// 404 for anything not matched (avoid path traversal info leaks)
@@ -103,7 +103,7 @@ func main() {
 func seedTestKey(store *auth.APIKeyStore) {
 	key, plain, err := store.Generate("biz_test_01", models.CreateAPIKeyRequest{
 		Name:   "Test Key",
-		Scopes: []models.APIKeyScope{models.ScopeRead, models.ScopeTransfer, models.ScopeCrypto, models.ScopeWebhooks},
+		Scopes: []models.APIKeyScope{models.ScopeRead, models.ScopeTransfer, models.ScopeCrypto, models.ScopeWebhooks, models.ScopeAPIKeys},
 	})
 	if err != nil {
 		return

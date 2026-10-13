@@ -5,13 +5,39 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"regexp"
+	"sync"
 	"time"
 
 	"github.com/vonix/api/internal/auth"
 	"github.com/vonix/api/internal/models"
 	"github.com/vonix/api/internal/webhook"
 )
+
+// idempotencyStore prevents duplicate financial operations keyed by (businessID, externalID).
+var (
+	idempotencyMu    sync.Mutex
+	idempotencyCache = map[string]models.Transfer{}
+)
+
+func idempotencyKey(bid, extID string) string { return bid + "|" + extID }
+
+// checkOrStore returns (existing, true) if extID was already processed, else stores tx and returns (tx, false).
+func checkOrStore(bid, extID string, tx models.Transfer) (models.Transfer, bool) {
+	if extID == "" {
+		return tx, false
+	}
+	k := idempotencyKey(bid, extID)
+	idempotencyMu.Lock()
+	defer idempotencyMu.Unlock()
+	if existing, ok := idempotencyCache[k]; ok {
+		return existing, true
+	}
+	idempotencyCache[k] = tx
+	return tx, false
+}
 
 type TransferHandler struct {
 	Webhooks *webhook.Store
@@ -31,7 +57,13 @@ func (h *TransferHandler) CreateFiatTransfer(w http.ResponseWriter, r *http.Requ
 	bid := auth.BusinessID(r)
 	transfer := buildTransfer(bid, "fiat_transfer", req)
 
-	// In production: persist to DB, enqueue to payment rails, debit balance
+	// Idempotency: same external_id + same business = return original result
+	if existing, dup := checkOrStore(bid, req.ExternalID, transfer); dup {
+		respond(w, http.StatusOK, existing)
+		return
+	}
+
+	// In production: persist to DB, enqueue to payment rails, debit balance atomically
 	go h.Webhooks.Dispatch(bid, models.EventTransferCreated, transfer)
 	go func() {
 		time.Sleep(2 * time.Second)
@@ -49,7 +81,6 @@ func (h *TransferHandler) ListTransactions(w http.ResponseWriter, r *http.Reques
 	now := time.Now().UTC()
 	completed := now.Add(-2 * time.Minute)
 
-	// In production: query DB with cursor-based pagination
 	txns := []models.Transfer{
 		{
 			ID:          "txn_01j9abc",
@@ -83,7 +114,7 @@ func buildTransfer(businessID, transferType string, req models.CreateTransferReq
 		Currency:   req.Currency,
 		Amount:     req.Amount,
 		Fee:        "0.50",
-		Net:        req.Amount, // simplified
+		Net:        req.Amount,
 		Recipient:  req.Recipient,
 		Reference:  req.Reference,
 		ExternalID: req.ExternalID,
@@ -91,9 +122,22 @@ func buildTransfer(businessID, transferType string, req models.CreateTransferReq
 	}
 }
 
+// amountRe validates: optional sign not allowed, digits with optional decimal and up to 8 places.
+var amountRe = regexp.MustCompile(`^[1-9]\d{0,14}(\.\d{1,8})?$|^0\.\d{1,8}[1-9]\d*$`)
+
+func validateAmount(amount string) error {
+	if amount == "" {
+		return errors.New("amount is required")
+	}
+	if !amountRe.MatchString(amount) {
+		return fmt.Errorf("amount '%s' is invalid: must be a positive decimal with up to 8 decimal places", amount)
+	}
+	return nil
+}
+
 func validateTransferRequest(req models.CreateTransferRequest) error {
-	if req.Amount == "" || req.Amount == "0" {
-		return errors.New("amount is required and must be non-zero")
+	if err := validateAmount(req.Amount); err != nil {
+		return err
 	}
 	if req.Currency == "" {
 		return errors.New("currency is required")

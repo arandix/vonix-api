@@ -47,6 +47,7 @@ const (
 	ScopeTransfer      APIKeyScope = "transfers:write"
 	ScopeCrypto        APIKeyScope = "crypto:write"
 	ScopeWebhooks      APIKeyScope = "webhooks:write"
+	ScopeAPIKeys       APIKeyScope = "api_keys:write" // administrative — key management only
 )
 
 type Balance struct {

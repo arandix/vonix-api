@@ -7,11 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,20 +22,28 @@ import (
 )
 
 const (
-	signatureHeader = "Vonix-Signature"
-	timestampHeader = "Vonix-Timestamp"
-	apiVersion      = "2024-01"
-	deliveryTimeout = 10 * time.Second
-	maxRetries      = 3
+	signatureHeader   = "Vonix-Signature"
+	timestampHeader   = "Vonix-Timestamp"
+	apiVersion        = "2024-01"
+	deliveryTimeout   = 10 * time.Second
+	maxRetries        = 3
+	maxTimestampAge   = 5 * time.Minute  // replay-attack window
+	dedupeWindowSize  = 1024             // max in-memory dedup entries
 )
 
 type Store struct {
 	mu       sync.RWMutex
 	webhooks map[string]*models.Webhook
+	// deduplication: tracks recently seen event payload IDs to prevent double-processing
+	dedupeMu   sync.Mutex
+	dedupeIDs  map[string]time.Time
 }
 
 func NewStore() *Store {
-	return &Store{webhooks: make(map[string]*models.Webhook)}
+	return &Store{
+		webhooks:  make(map[string]*models.Webhook),
+		dedupeIDs: make(map[string]time.Time),
+	}
 }
 
 func (s *Store) Create(businessID string, req models.CreateWebhookRequest) (*models.Webhook, error) {
@@ -100,8 +110,9 @@ func (s *Store) Dispatch(businessID string, event models.WebhookEvent, data any)
 		return
 	}
 
+	payloadID := newID()
 	payload := models.WebhookPayload{
-		ID:         newID(),
+		ID:         payloadID,
 		Event:      event,
 		APIVersion: apiVersion,
 		CreatedAt:  time.Now().UTC(),
@@ -110,6 +121,12 @@ func (s *Store) Dispatch(businessID string, event models.WebhookEvent, data any)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		slog.Error("webhook marshal failed", "err", err)
+		return
+	}
+
+	// Deduplicate: skip if this event ID was already dispatched recently
+	if s.seenEvent(payloadID) {
+		slog.Warn("webhook duplicate event skipped", "event_id", payloadID)
 		return
 	}
 
@@ -159,10 +176,62 @@ func sign(secret, ts string, body []byte) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// VerifySignature verifies an incoming webhook using the stored secret.
-func VerifySignature(secret, ts, sigHeader string, body []byte) bool {
+// VerifySignature verifies an incoming webhook signature.
+// It validates: format, timestamp freshness (5 min), and HMAC — in that order,
+// using constant-time comparison only after format/length checks pass.
+func VerifySignature(secret, ts, sigHeader string, body []byte) error {
+	// 1. Validate format: must start with "sha256=" followed by 64 hex chars
+	const prefix = "sha256="
+	if !strings.HasPrefix(sigHeader, prefix) {
+		return errors.New("signature must start with 'sha256='")
+	}
+	hexPart := sigHeader[len(prefix):]
+	if len(hexPart) != 64 {
+		return errors.New("signature has invalid length")
+	}
+	for _, c := range hexPart {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return errors.New("signature contains invalid characters")
+		}
+	}
+
+	// 2. Validate timestamp: must be a unix second within ±maxTimestampAge
+	epochSec, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || epochSec <= 0 {
+		return errors.New("timestamp is invalid")
+	}
+	age := time.Since(time.Unix(epochSec, 0)).Abs()
+	if age > maxTimestampAge {
+		return fmt.Errorf("timestamp is too old or too far in the future (age: %s)", age.Round(time.Second))
+	}
+
+	// 3. Constant-time HMAC comparison
 	expected := "sha256=" + sign(secret, ts, body)
-	return hmac.Equal([]byte(expected), []byte(sigHeader))
+	if !hmac.Equal([]byte(expected), []byte(sigHeader)) {
+		return errors.New("signature does not match")
+	}
+	return nil
+}
+
+// seenEvent returns true and records the ID if it has not been seen recently.
+// Prunes the map when it grows beyond dedupeWindowSize.
+func (s *Store) seenEvent(id string) bool {
+	s.dedupeMu.Lock()
+	defer s.dedupeMu.Unlock()
+	cutoff := time.Now().Add(-maxTimestampAge * 2)
+	if t, ok := s.dedupeIDs[id]; ok && t.After(cutoff) {
+		return true
+	}
+	// Prune old entries when the map is large
+	if len(s.dedupeIDs) >= dedupeWindowSize {
+		for k, t := range s.dedupeIDs {
+			if t.Before(cutoff) {
+				delete(s.dedupeIDs, k)
+			}
+		}
+	}
+	s.dedupeIDs[id] = time.Now()
+	return false
 }
 
 // matchesEvent checks if the event matches any registered pattern.

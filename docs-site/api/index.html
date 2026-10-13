@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vonix Business API Reference</title>
+  <link rel="icon" href="https://getvonix.com/favicon.ico" />
+  <style>
+    body { margin: 0; padding: 0; }
+    redoc-tag { display: block; }
+  </style>
+</head>
+<body>
+  <redoc spec-url="../openapi.yaml"
+    theme='{
+      "colors": {
+        "primary": { "main": "#6C5CE7" }
+      },
+      "typography": {
+        "fontFamily": "Inter, system-ui, sans-serif",
+        "headings": { "fontFamily": "Inter, system-ui, sans-serif" }
+      },
+      "sidebar": {
+        "backgroundColor": "#0f0f1a",
+        "textColor": "#e2e8f0"
+      }
+    }'
+    hide-download-button
+    expand-responses="200,201"
+  ></redoc>
+  <script src="https://cdn.jsdelivr.net/npm/redoc@2.1.5/bundles/redoc.standalone.js"></script>
+</body>
+</html>
